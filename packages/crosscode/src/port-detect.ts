@@ -84,9 +84,6 @@ export function waitForOpencodePort(opts: {
     }
     proc.stdout?.on("data", collect)
     proc.stderr?.on("data", collect)
-    proc.on("exit", () => {
-        exited = true
-    })
 
     const fromLogs = (): number | null => {
         for (const pattern of PORT_PATTERNS) {
@@ -96,7 +93,7 @@ export function waitForOpencodePort(opts: {
         return null
     }
 
-    return new Promise<number>((resolve) => {
+    return new Promise<number>((resolve, reject) => {
         const finish = (port: number) => {
             if (resolved) return
             resolved = true
@@ -121,5 +118,16 @@ export function waitForOpencodePort(opts: {
             if (ports.length > 0) return finish(ports[0])
             finish(fromLogs() ?? requestedPort)
         }, timeoutMs)
+
+        proc.on("exit", (code) => {
+            exited = true
+            clearInterval(interval)
+            clearTimeout(timeout)
+            if (resolved) return
+            const logged = fromLogs()
+            if (logged) return finish(logged)
+            resolved = true
+            reject(new Error(`opencode exited with code ${code} before port was detected`))
+        })
     })
 }
