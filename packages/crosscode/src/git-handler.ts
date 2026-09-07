@@ -1,8 +1,8 @@
 import { execFile } from "child_process"
 import crypto from "crypto"
 import http from "http"
+import { debug } from "./util"
 
-const DEBUG = process.env.CROSSCODE_DEBUG === "1"
 const GIT_TIMEOUT_MS = 10_000
 const GIT_MAX_BUFFER = 10 * 1024 * 1024
 const FIELD_SEP = "\x1f"
@@ -41,14 +41,6 @@ export type GitCommitDetail = {
     files: GitCommitFile[]
     additions: number
     deletions: number
-}
-
-function debug(msg: string, meta?: Record<string, unknown>) {
-    if (DEBUG) {
-        const ts = new Date().toISOString()
-        const extra = meta ? ` ${JSON.stringify(meta)}` : ""
-        console.log(`[${ts}] [git-handler] ${msg}${extra}`)
-    }
 }
 
 function sendJson(res: http.ServerResponse, status: number, body: unknown) {
