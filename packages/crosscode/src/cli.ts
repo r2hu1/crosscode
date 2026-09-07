@@ -1,275 +1,23 @@
 #!/usr/bin/env node
 
-import { spawn, execFile, execFileSync } from "child_process"
-import { createWriteStream, mkdirSync, existsSync, readFileSync, writeFileSync, statSync, renameSync, unlinkSync } from "fs"
 import { readFile } from "fs/promises"
-import { join } from "path"
-import { homedir } from "os"
-import qrcode from "qrcode-terminal"
 import chalk from "chalk"
-import ora from "ora"
-import crypto from "crypto"
-import http from "http"
-import net from "net"
+import qrcode from "qrcode-terminal"
 import { encodeQrPayload } from "@crosscode/shared"
+import { debug, checkDep, setLogWriter, getFreePort } from "./util"
+import { logCrosscode, closeAllLogs, crosscodeLogFile, cloudflaredLogFile, opencodeLogFile } from "./log"
+import { readConfig, saveConfig, getProjectConfig, ensureSessionToken } from "./config"
+import { loginFlow, refreshTier } from "./auth"
+import { proxyAgent } from "./proxy"
 import { onKeypress, cleanupKeypress } from "./keypress"
-import { connectTunnel } from "./tunnel-client"
-import { handleGitRequest } from "./git-handler"
-import { waitForOpencodePort } from "./port-detect"
+import { startTunnelProvider } from "./providers/tunnel"
+import { startCloudflaredProvider } from "./providers/cloudflared"
+import { startNgrokProvider } from "./providers/ngrok"
 
 const children: import("child_process").ChildProcess[] = []
 let isShuttingDown = false
-const logDir = join(homedir(), ".crosscode")
-const configFile = join(logDir, "config.json")
-const MAX_LOG_SIZE = 1024 * 1024
-const DEBUG = process.env.CROSSCODE_DEBUG === "1"
-const MAX_BODY_SIZE = 10 * 1024 * 1024
-const HOP_BY_HOP = new Set(["host", "connection", "keep-alive", "transfer-encoding", "upgrade", "proxy-authenticate", "proxy-authorization", "te", "trailer"])
 
-const proxyAgent = new http.Agent({ keepAlive: true, maxSockets: 50 })
-
-function getFreePort(): Promise<number> {
-    return new Promise((resolve, reject) => {
-        const srv = net.createServer()
-        srv.on("error", reject)
-        srv.listen(0, "127.0.0.1", () => {
-            const addr = srv.address() as net.AddressInfo
-            const port = addr.port
-            srv.close(() => resolve(port))
-        })
-    })
-}
-
-if (!existsSync(logDir))
-    mkdirSync(logDir, {
-        recursive: true,
-        mode: 0o700,
-    })
-
-const crosscodeLogFile = join(logDir, "crosscode.log")
-const cloudflaredLogFile = join(logDir, "cloudflared.log")
-const opencodeLogFile = join(logDir, "opencode.log")
-const ngrokLogFile = join(logDir, "ngrok.log")
-
-function rotateLogIfNeeded(logFile: string) {
-    try {
-        if (existsSync(logFile)) {
-            const stats = statSync(logFile)
-            if (stats.size > MAX_LOG_SIZE) {
-                const backup = `${logFile}.1`
-                if (existsSync(backup)) unlinkSync(backup)
-                renameSync(logFile, backup)
-            }
-        }
-    } catch {}
-}
-
-rotateLogIfNeeded(crosscodeLogFile)
-rotateLogIfNeeded(cloudflaredLogFile)
-rotateLogIfNeeded(opencodeLogFile)
-rotateLogIfNeeded(ngrokLogFile)
-
-const crosscodeLogStream = createWriteStream(crosscodeLogFile, { flags: "a", mode: 0o600 })
-const cloudflaredLogStream = createWriteStream(cloudflaredLogFile, { flags: "a", mode: 0o600 })
-const opencodeLogStream = createWriteStream(opencodeLogFile, { flags: "a", mode: 0o600 })
-const ngrokLogStream = createWriteStream(ngrokLogFile, { flags: "a", mode: 0o600 })
-
-function logCrosscode(msg: string) {
-    crosscodeLogStream.write(`${new Date().toISOString()} ${msg}\n`)
-}
-
-function debug(msg: string, meta?: Record<string, unknown>) {
-    if (DEBUG) {
-        const ts = new Date().toISOString()
-        const extra = meta ? ` ${JSON.stringify(meta)}` : ""
-        const line = `[${ts}] [DEBUG] ${msg}${extra}`
-        console.log(chalk.dim(line))
-        logCrosscode(line)
-    }
-}
-
-function censorAuth(val: string | undefined): string {
-    if (!val) return "<none>"
-    if (val.startsWith("Basic ")) {
-        return `Basic ${val.substring(6, 14)}...`
-    }
-    return `${val.substring(0, 8)}...`
-}
-
-function censorToken(val: string): string {
-    if (val.length <= 16) return "***"
-    return `${val.substring(0, 8)}...${val.substring(val.length - 4)}`
-}
-
-function checkDep(name: string): boolean {
-    const finder = process.platform === "win32" ? "where" : "which"
-    try {
-        execFileSync(finder, [name], { stdio: "ignore" })
-        return true
-    } catch {
-        return false
-    }
-}
-
-function spawnCmd(cmd: string, args: string[], opts: Parameters<typeof spawn>[2] = {}) {
-    return spawn(cmd, args, { ...opts, shell: false })
-}
-
-type CloudflaredTunnel = {
-    name: string
-    credentialsPath: string
-    url: string
-}
-
-type ProjectConfig = {
-    path?: string
-    sessionToken?: string
-    projectId?: string
-    cloudflaredTunnel?: CloudflaredTunnel
-    port?: number
-}
-
-type Config = {
-    ngrokToken?: string
-    port?: number
-    tunnelWsUrl?: string
-    sessionToken?: string
-    projectId?: string
-    cloudflaredTunnel?: CloudflaredTunnel
-    projects?: Record<string, ProjectConfig>
-    auth?: {
-        email?: string
-        sessionToken?: string
-        tier?: string
-    }
-}
-
-function readConfig(): Config {
-    if (!existsSync(configFile)) return {}
-    try {
-        return JSON.parse(readFileSync(configFile, "utf-8"))
-    } catch {
-        return {}
-    }
-}
-
-function saveConfig(config: Config) {
-    writeFileSync(configFile, JSON.stringify(config, null, 2), { mode: 0o600 })
-}
-
-function getProjectKey(): string {
-    const cwd = process.cwd()
-    const hash = crypto.createHash("sha256").update(cwd).digest("hex").slice(0, 16)
-    return process.env.CROSSCODE_PROJECT_KEY || hash
-}
-
-function getProjectConfig(config: Config): ProjectConfig {
-    const key = getProjectKey()
-    if (!config.projects) config.projects = {}
-    if (!config.projects[key]) {
-        const legacy: ProjectConfig = {}
-        let migrated = false
-        if (config.projectId && !Object.values(config.projects).some((p) => p.projectId === config.projectId)) {
-            legacy.projectId = config.projectId
-            migrated = true
-        }
-        if (config.sessionToken && !Object.values(config.projects).some((p) => p.sessionToken === config.sessionToken)) {
-            legacy.sessionToken = config.sessionToken
-            migrated = true
-        }
-        if (config.cloudflaredTunnel && !Object.values(config.projects).some((p) => p.cloudflaredTunnel?.name === config.cloudflaredTunnel?.name)) {
-            legacy.cloudflaredTunnel = config.cloudflaredTunnel
-            migrated = true
-        }
-        config.projects[key] = { path: process.cwd(), ...legacy }
-        if (migrated) {
-            saveConfig(config)
-            logCrosscode(`Migrated legacy global identity to project ${process.cwd()} (key: ${key})`)
-        }
-    } else if (!config.projects[key].path) {
-        config.projects[key].path = process.cwd()
-    }
-    return config.projects[key]
-}
-
-function saveProjectConfig(config: Config) {
-    const key = getProjectKey()
-    if (config.projects?.[key]) config.projects[key].path = process.cwd()
-    saveConfig(config)
-}
-
-// Stable, persistent per-project session identity so the QR/URL stays the
-// same across CLI restarts and network blips, without leaking the same
-// identity across different project directories. Without this the opencode
-// password + QR token are randomized every run, making it impossible for a
-// returning mobile client to reconnect.
-function ensureSessionToken(config: Config, project?: ProjectConfig): string {
-    const target = project ?? getProjectConfig(config)
-    if (!target.sessionToken) {
-        target.sessionToken = crypto.randomBytes(32).toString("hex")
-        saveProjectConfig(config)
-        logCrosscode(`Session token generated for ${process.cwd()} (censored: ${censorToken(target.sessionToken)})`)
-    } else {
-        debug("session token reused from project config", { cwd: process.cwd() })
-    }
-    return target.sessionToken
-}
-
-function ensureProjectId(config: Config, project?: ProjectConfig): string {
-    const target = project ?? getProjectConfig(config)
-    if (!target.projectId) {
-        target.projectId = crypto.randomBytes(4).toString("hex")
-        saveProjectConfig(config)
-        logCrosscode(`Project ID generated for ${process.cwd()}: ${target.projectId}`)
-    } else {
-        debug("project ID reused from project config", { projectId: target.projectId, cwd: process.cwd() })
-    }
-    return target.projectId
-}
-
-const cloudflaredTunnelDir = join(logDir, "cloudflared")
-const cfCertPath = join(homedir(), ".cloudflared", "cert.pem")
-
-// Use a persistent named cloudflared tunnel so the public URL is stable
-// (<tunnelId>.cfargotunnel.com) across restarts and reconnects, instead of
-// the random ephemeral quick tunnel that rotates its URL on every (re)start.
-// Returns null when cloudflared isn't logged in yet, falling back to the
-// quick tunnel (which still works but changes URL on restart).
-async function ensureCloudflaredNamedTunnel(config: Config, project?: ProjectConfig): Promise<{ name: string; credentialsPath: string; url: string } | null> {
-    if (!existsSync(cfCertPath)) {
-        debug("cloudflared not logged in (no cert.pem); falling back to quick tunnel")
-        return null
-    }
-    const target = project ?? getProjectConfig(config)
-    if (target.cloudflaredTunnel && existsSync(target.cloudflaredTunnel.credentialsPath)) {
-        return target.cloudflaredTunnel
-    }
-    const projectId = ensureProjectId(config, target)
-    const name = `crosscode-${projectId}`
-    const credentialsPath = join(cloudflaredTunnelDir, `${name}.json`)
-    try {
-        if (!existsSync(cloudflaredTunnelDir)) mkdirSync(cloudflaredTunnelDir, { recursive: true, mode: 0o700 })
-        await new Promise<void>((resolve, reject) => {
-            execFile("cloudflared", ["tunnel", "create", "--credentials-file", credentialsPath, name], { stdio: "ignore" }, (err) => {
-                if (err) reject(err)
-                else resolve()
-            })
-        })
-    } catch (e) {
-        debug("cloudflared tunnel create failed", { error: (e as Error).message })
-        return null
-    }
-    let url = ""
-    try {
-        const creds = JSON.parse(readFileSync(credentialsPath, "utf-8"))
-        const id = creds.TunnelID || creds.id
-        if (id) url = `https://${id}.cfargotunnel.com`
-    } catch {}
-    target.cloudflaredTunnel = { name, credentialsPath, url }
-    saveProjectConfig(config)
-    logCrosscode(`Cloudflared named tunnel created: ${name} (${url})`)
-    return target.cloudflaredTunnel
-}
+setLogWriter(logCrosscode)
 
 function printTunnelQr(url: string, token: string, opencodePort: number, requestedPort: number) {
     const payload = encodeQrPayload({ url, token, v: 1 })
@@ -282,316 +30,12 @@ function printTunnelQr(url: string, token: string, opencodePort: number, request
     console.log(chalk.dim.bold("[Press 'l' for logs  •  'h' for help  •  Ctrl+C to exit]"))
 }
 
-const WEB_URL = process.env.CROSSCODE_WEB_URL || "https://crosscode.site"
-const AUTH_API_URL = process.env.CROSSCODE_AUTH_URL || `${WEB_URL}/api/auth`
-
-function promptInput(prompt: string): Promise<string> {
-    return new Promise((resolve) => {
-        process.stdout.write(prompt)
-        process.stdin.resume()
-        process.stdin.setEncoding("utf8")
-        process.stdin.setRawMode(true)
-
-        let input = ""
-        const onData = (char: string) => {
-            if (char === "\r" || char === "\n") {
-                process.stdin.setRawMode(false)
-                process.stdin.removeListener("data", onData)
-                process.stdin.pause()
-                console.log()
-                resolve(input)
-            } else if (char === "\u0003") {
-                process.stdin.setRawMode(false)
-                process.stdin.removeListener("data", onData)
-                process.stdin.pause()
-                console.log()
-                process.exit(1)
-            } else if (char === "\u007F" || char === "\b") {
-                if (input.length > 0) {
-                    input = input.slice(0, -1)
-                    process.stdout.write("\b \b")
-                }
-            } else {
-                input += char
-                process.stdout.write(char)
-            }
-        }
-
-        process.stdin.on("data", onData)
-    })
-}
-
-function openBrowser(url: string): void {
-    if (!url.startsWith("https://") && !url.startsWith("http://")) return
-    const platform = process.platform
-    try {
-        if (platform === "darwin") {
-            execFileSync("open", [url])
-        } else if (platform === "win32") {
-            execFileSync("cmd", ["/c", "start", "", url])
-        } else {
-            execFileSync("xdg-open", [url])
-        }
-    } catch {}
-}
-
-async function validateApiKey(apiKey: string): Promise<{ email: string; name: string; tier: string } | null> {    try {
-        debug("validating API key", { keyPrefix: apiKey.substring(0, 8) + "..." })
-        const response = await fetch(`${AUTH_API_URL}/api-key/validate`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ apiKey }),
-        })
-        if (!response.ok) {
-            console.log(chalk.dim(`\n Server returned ${response.status}`))
-            debug("API key validation failed", { status: response.status })
-            return null
-        }
-        const data = await response.json()
-        debug("API key validated", { email: data.email, tier: data.tier })
-        return { email: data.email, name: data.name, tier: data.tier }
-    } catch (err) {
-        debug("API key validation error", { error: err instanceof Error ? err.message : String(err) })
-        console.log(chalk.dim(`\n Connection failed: ${err instanceof Error ? err.message : err}`))
-        return null
-    }
-}
-
-async function refreshTier(config: Config): Promise<void> {
-    if (!config.auth?.sessionToken) return
-    try {
-        const result = await validateApiKey(config.auth.sessionToken)
-        if (!result) return
-        if (result.tier !== config.auth.tier || result.email !== config.auth.email) {
-            config.auth.tier = result.tier
-            config.auth.email = result.email
-            saveConfig(config)
-            debug("tier refreshed", { tier: result.tier, email: result.email })
-        }
-    } catch (err) {
-        debug("tier refresh failed", { error: err instanceof Error ? err.message : String(err) })
-    }
-}
-
-async function loginFlow(config: Config): Promise<boolean> {
-    console.log(chalk.cyan("\n CrossCode Authentication\n"))
-    console.log(chalk.white(" Sign in to unlock dedicated tunnels and unlimited connections.\n"))
-
-    const loginUrl = `${WEB_URL}/login`
-    console.log(chalk.blue(" Opening browser..."))
-    console.log(chalk.dim(` If browser doesn't open, visit: ${loginUrl}\n`))
-
-    openBrowser(loginUrl)
-
-    console.log(chalk.white(" After logging in, you'll see an API key on the dashboard."))
-    console.log(chalk.dim(" Copy the API key and paste it below.\n"))
-
-    const apiKey = (await promptInput(chalk.yellow(" API Key: "))).trim()
-
-    if (!apiKey) {
-        console.log(chalk.red("\n API key is required.\n"))
-        return false
-    }
-
-    const spinner = ora(chalk.blue("Validating API key...")).start()
-    const result = await validateApiKey(apiKey)
-    spinner.stop()
-
-    if (!result) {
-        console.log(chalk.red("\n Invalid API key. Please try again.\n"))
-        return false
-    }
-
-    config.auth = {
-        email: result.email,
-        sessionToken: apiKey,
-        tier: result.tier,
-    }
-    saveConfig(config)
-
-    console.log(chalk.green(`\n Logged in as ${result.email}`))
-    console.log(chalk.dim(` Tier: ${result.tier}\n`))
-    return true
-}
-
-async function setupNgrokToken(): Promise<string> {
-    console.log(chalk.cyan("\n ngrok requires a free auth token.\n"))
-    console.log(chalk.white(" 1. Sign up at: ") + chalk.underline.blue("https://dashboard.ngrok.com/signup"))
-    console.log(chalk.white(" 2. Get your token at: ") + chalk.underline.blue("https://dashboard.ngrok.com/get-started/your-authtoken"))
+function printHelp() {
+    console.log(chalk.cyan("\n CrossCode Keybindings:\n"))
+    console.log(`  ${chalk.green("l")}  Toggle log viewer`)
+    console.log(`  ${chalk.green("h")}  Show this help`)
+    console.log(`  ${chalk.green("Ctrl+C")}  Shut down`)
     console.log()
-
-    const token = await new Promise<string>((resolve) => {
-        process.stdout.write(chalk.yellow(" Paste your ngrok auth token: "))
-        process.stdin.resume()
-        process.stdin.setEncoding("utf8")
-
-        const onData = (data: Buffer) => {
-            const input = data.toString().trim()
-            if (input.length > 0) {
-                process.stdin.removeListener("data", onData)
-                process.stdin.pause()
-                resolve(input)
-            }
-        }
-
-        process.stdin.on("data", onData)
-    })
-
-    return token
-}
-
-function sanitizeUrlPath(url: string | undefined): string {
-    if (!url || url.length === 0) return "/"
-    let decoded: string
-    try {
-        decoded = decodeURIComponent(url.split("#")[0])
-    } catch {
-        return "/"
-    }
-    const queryIndex = decoded.indexOf("?")
-    const rawPath = queryIndex === -1 ? decoded : decoded.slice(0, queryIndex)
-    const rawQuery = queryIndex === -1 ? "" : decoded.slice(queryIndex + 1)
-    if (!rawPath.startsWith("/")) return "/"
-    const cleaned = rawPath.replace(/\/+/g, "/")
-    if (cleaned.includes("..") || cleaned.includes("@") || cleaned.includes("\\")) return "/"
-    return `${cleaned || "/"}${rawQuery ? `?${rawQuery}` : ""}`
-}
-
-function createOpencodeProxy(targetPort: number, sessionToken: string, logPrefix: string): http.Server {
-    return http.createServer(async (req, res) => {
-        const safePath = sanitizeUrlPath(req.url)
-        const targetUrl = `http://127.0.0.1:${targetPort}${safePath}`
-        const authHeader = req.headers["authorization"]
-
-        debug(`${logPrefix} request received`, {
-            method: req.method,
-            url: req.url,
-            safePath,
-            hasAuth: !!authHeader,
-            auth: censorAuth(authHeader),
-        })
-
-        if (req.method === "OPTIONS") {
-            debug("handling CORS preflight")
-            res.writeHead(204, {
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
-                "Access-Control-Allow-Headers": "Content-Type, Authorization",
-                "Access-Control-Max-Age": "86400",
-            })
-            res.end()
-            return
-        }
-
-        if (req.url === "/mobile-event" && req.method === "POST") {
-            debug("handling SSE request")
-            res.writeHead(200, {
-                "Content-Type": "text/event-stream",
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "Access-Control-Allow-Origin": "*",
-            })
-
-            let sseAuth = authHeader || ""
-            if (sseAuth && !sseAuth.startsWith("Basic ")) {
-                sseAuth = `Basic ${Buffer.from(`:${sseAuth}`).toString("base64")}`
-                debug("converted SSE auth to Basic format")
-            }
-
-            const sseReq = http.get(`http://127.0.0.1:${targetPort}/event`, {
-                headers: {
-                    "Accept": "text/event-stream",
-                    "Authorization": sseAuth,
-                },
-            }, (sseRes) => {
-                debug("SSE upstream connected", { status: sseRes.statusCode })
-                sseRes.on("data", (chunk) => { res.write(chunk) })
-                sseRes.on("end", () => { debug("SSE upstream ended"); res.end() })
-            })
-
-            sseReq.on("error", (err) => {
-                debug("SSE upstream error", { error: err.message })
-                res.end()
-            })
-
-            req.on("close", () => {
-                debug("SSE client disconnected")
-                sseReq.destroy()
-            })
-
-            return
-        }
-
-        if (await handleGitRequest(req, res, { worktree: process.cwd(), sessionToken })) {
-            return
-        }
-
-        const forwardHeaders: Record<string, string | string[]> = {}
-        for (const [key, value] of Object.entries(req.headers)) {
-            if (!HOP_BY_HOP.has(key.toLowerCase())) forwardHeaders[key] = value
-        }
-        forwardHeaders["host"] = `127.0.0.1:${targetPort}`
-
-        if (authHeader && !authHeader.startsWith("Basic ")) {
-            forwardHeaders["authorization"] = `Basic ${Buffer.from(`:${authHeader}`).toString("base64")}`
-            debug("converted auth to Basic format")
-        }
-
-        debug("forwarding to opencode", {
-            targetUrl,
-            method: req.method,
-            hasAuth: !!forwardHeaders["authorization"],
-            auth: censorAuth(forwardHeaders["authorization"] as string),
-        })
-
-        const proxyReq = http.request(targetUrl, {
-            method: req.method,
-            headers: forwardHeaders,
-            agent: proxyAgent,
-        }, (proxyRes) => {
-            debug("opencode responded", { status: proxyRes.statusCode, method: req.method, path: safePath })
-            res.writeHead(proxyRes.statusCode || 500, proxyRes.headers)
-            proxyRes.pipe(res)
-        })
-
-        proxyReq.on("error", (err) => {
-            debug("proxy request error", { error: err.message })
-            res.writeHead(502)
-            res.end("Bad Gateway")
-        })
-
-        let bodySize = 0
-        let bodyTooLarge = false
-
-        req.on("data", (chunk) => {
-            bodySize += chunk.length
-            if (bodySize > MAX_BODY_SIZE) {
-                bodyTooLarge = true
-                debug("request body too large", { size: bodySize, max: MAX_BODY_SIZE })
-                req.destroy()
-                proxyReq.destroy()
-                if (!res.headersSent) {
-                    res.writeHead(413)
-                    res.end("Request body too large")
-                }
-                return
-            }
-            proxyReq.write(chunk)
-        })
-
-        req.on("end", () => {
-            if (!bodyTooLarge) proxyReq.end()
-        })
-
-        req.on("error", (err) => {
-            debug("request stream error", { error: err.message })
-            proxyReq.destroy()
-            if (!res.headersSent) {
-                res.writeHead(500)
-                res.end("Internal Server Error")
-            }
-        })
-    })
 }
 
 async function main() {
@@ -673,7 +117,7 @@ ${chalk.dim("Documentation: https://github.com/snhsish/crosscode")}
     let logsVisible = false
     let tunnelUrl = ""
 
-    logCrosscode(`CrossCode starting up (tunnel: ${tunnelProvider}, debug: ${DEBUG})`)
+    logCrosscode(`CrossCode starting up (tunnel: ${tunnelProvider}, debug: ${process.env.CROSSCODE_DEBUG === "1"})`)
     debug("startup config", { tunnelProvider, port, hasAuth: !!config.auth?.sessionToken })
 
     if (!checkDep("opencode")) {
@@ -714,328 +158,38 @@ ${chalk.dim("Documentation: https://github.com/snhsish/crosscode")}
             chalk.dim(" to use the free built-in CrossCode tunnel.\n"))
     }
 
-    let tunnelFailed = false
-
-    if (tunnelProvider === "tunnel") {
-        const spinner = ora(chalk.blue("Starting ", chalk.italic("opencode serve"))).start()
-
-        const sessionToken = ensureSessionToken(config, project)
-
-        const opencode = spawnCmd("opencode", ["serve", "--print-logs", "--log-level", "DEBUG", "--port", String(port), "--hostname", "127.0.0.1"], {
-            cwd: process.cwd(),
-            env: { ...process.env, OPENCODE_SERVER_PASSWORD: sessionToken },
-            stdio: ["ignore", "pipe", "pipe"]
-        })
-
-        children.push(opencode)
-
-        let opencodePort = port
-
-        opencode.on("spawn", () => {
-            spinner.text = chalk.green.italic("opencode serve running") + chalk.yellow.italic("  •  Detecting port...")
-            logCrosscode("opencode serve started (PID: " + opencode.pid + ")")
-            debug("opencode spawned", { pid: opencode.pid })
-        })
-        opencode.on("error", (err) => {
-            spinner.fail(chalk.red.italic("Failed to start opencode serve"))
-            logCrosscode("opencode serve error: " + err.message)
-            debug("opencode spawn error", { error: err.message })
-        })
-
-        let proxyPort = await getFreePort()
-        while (proxyPort === port) proxyPort = await getFreePort()
-
-        waitForOpencodePort({ proc: opencode, requestedPort: port, onData: d => opencodeLogStream.write(d) }).then((detectedPort) => {
-            opencodePort = detectedPort
-            startProxy(detectedPort, proxyPort, sessionToken, port, spinner)
-        })
-
-        function startProxy(targetPort: number, proxyPort: number, sessionToken: string, requestedPort: number, spinner: any) {
-            if (targetPort !== requestedPort) {
-                logCrosscode(`Using detected port ${targetPort} instead of requested port ${requestedPort}`)
-                debug("using detected port", { detected: targetPort, requested: requestedPort })
-            }
-
-            const proxy = createOpencodeProxy(targetPort, sessionToken, "tunnel")
-
-            proxy.listen(proxyPort, "127.0.0.1", () => {
-                logCrosscode(`SSE proxy started on port ${proxyPort}`)
-                debug("proxy listening", { port: proxyPort, targetPort })
-                
-                const testReq = http.request(`http://127.0.0.1:${targetPort}/global/health`, {
-                    method: "GET",
-                    headers: {
-                        "Authorization": `Basic ${Buffer.from(`opencode:${sessionToken}`).toString("base64")}`
-                    },
-                    agent: proxyAgent,
-                }, (testRes) => {
-                    debug("health check result", { status: testRes.statusCode })
-                    logCrosscode(`Direct test to opencode: ${testRes.statusCode}`)
-                })
-                testReq.on("error", (e) => {
-                    debug("health check failed", { error: e.message })
-                    logCrosscode(`Direct test to opencode failed: ${e.message}`)
-                })
-                testReq.end()
-                
-                spinner.text = chalk.green.italic("opencode serve running") + chalk.yellow.italic("  •  Connecting to tunnel server...")
-
-                const projectId = ensureProjectId(config, project)
-                logCrosscode(`Project ID: ${projectId}`)
-                debug("connecting to tunnel", { projectId, proxyPort })
-
-                const tunnelTimeout = setTimeout(() => {
-                    spinner.fail(chalk.red.italic("Tunnel connection timed out"))
-                    logCrosscode("Tunnel connection timed out, falling back to cloudflared")
-                    debug("tunnel connection timeout")
-                    console.log(chalk.yellow("\n Falling back to Cloudflare tunnel...\n"))
-                    children.forEach(c => c.kill())
-                    children.length = 0
-                    tunnelFailed = true
-                }, 15_000)
-
-                const disconnectTunnel = connectTunnel(
-                    config.auth!.sessionToken!,
-                    projectId,
-                    proxyPort,
-                    config.tunnelWsUrl,
-                    (url) => {
-                        clearTimeout(tunnelTimeout)
-                        if (tunnelUrl) {
-                            if (tunnelUrl !== url) {
-                                tunnelUrl = url
-                                logCrosscode("Tunnel URL changed: " + tunnelUrl)
-                                console.log(chalk.yellow(`\n Tunnel URL changed: ${tunnelUrl}\n`))
-                            }
-                            return
-                        }
-                        tunnelUrl = url
-                        spinner.succeed(chalk.green("Tunnel ready"))
-                        logCrosscode("Tunnel ready: " + tunnelUrl)
-                        debug("tunnel connected", { tunnelUrl })
-                        printTunnelQr(tunnelUrl, sessionToken, opencodePort, port)
-                    },
-                    (err) => {
-                        clearTimeout(tunnelTimeout)
-                        spinner.fail(chalk.red.italic(`Tunnel error: ${err.message}`))
-                        logCrosscode(`Tunnel error: ${err.message}, falling back to cloudflared`)
-                        debug("tunnel error", { error: err.message })
-                        console.log(chalk.yellow("\n Falling back to Cloudflare tunnel...\n"))
-                        children.forEach(c => c.kill())
-                        children.length = 0
-                        disconnectTunnel()
-                        tunnelFailed = true
-                    }
-                )
-            })
-        }
+    // Fix C1: cloudflared fallback is invoked as a function, not gated behind an
+    // else-if that already evaluated before the async tunnel error occurs.
+    const launchCloudflaredFallback = () => {
+        children.forEach(c => c.kill())
+        children.length = 0
+        startCloudflaredProvider(
+            config, project, port, children,
+            () => isShuttingDown,
+            (url) => { tunnelUrl = url },
+            printTunnelQr,
+        )
     }
 
-    if (tunnelProvider === "ngrok") {
-        let ngrokToken = config.ngrokToken
-
-        if (!ngrokToken) {
-            ngrokToken = await setupNgrokToken()
-            config.ngrokToken = ngrokToken
-            saveConfig(config)
-            logCrosscode("ngrok auth token saved")
-            debug("ngrok token saved")
-        }
-
-        const spinner = ora(chalk.blue("Starting ", chalk.italic("opencode serve"))).start()
-
-        const sessionToken = ensureSessionToken(config, project)
-
-        const opencode = spawnCmd("opencode", ["serve", "--print-logs", "--log-level", "DEBUG", "--port", String(port), "--hostname", "127.0.0.1"], {
-            cwd: process.cwd(),
-            env: { ...process.env, OPENCODE_SERVER_PASSWORD: sessionToken },
-            stdio: ["ignore", "pipe", "pipe"]
+    if (tunnelProvider === "tunnel") {
+        await startTunnelProvider(config, project, port, children, {
+            onTunnelUrl: (url) => { tunnelUrl = url },
+            printQr: printTunnelQr,
+            onFallbackNeeded: launchCloudflaredFallback,
         })
-
-        children.push(opencode)
-
-        let opencodePort = port
-
-        opencode.on("spawn", () => {
-            spinner.text = chalk.green.italic("opencode serve running") + chalk.yellow.italic("  •  Detecting port...")
-            logCrosscode("opencode serve started (PID: " + opencode.pid + ")")
-            debug("opencode spawned", { pid: opencode.pid })
-        })
-        opencode.on("error", (err) => {
-            spinner.fail(chalk.red.italic("Failed to start opencode serve"))
-            logCrosscode("opencode serve error: " + err.message)
-            debug("opencode spawn error", { error: err.message })
-        })
-
-        waitForOpencodePort({ proc: opencode, requestedPort: port, onData: d => opencodeLogStream.write(d) }).then((detectedPort) => {
-            opencodePort = detectedPort
-            if (detectedPort !== port) {
-                logCrosscode(`Using detected port ${detectedPort} instead of requested port ${port}`)
-                debug("using detected port", { detected: detectedPort, requested: port })
-            }
-
-            const ngrok = spawnCmd("ngrok", ["http", `--authtoken=${ngrokToken}`, `${detectedPort}`], {
-                stdio: ["ignore", "pipe", "pipe"]
-            })
-
-            children.push(ngrok)
-
-            ngrok.on("spawn", () => {
-                logCrosscode("ngrok started (PID: " + ngrok.pid + ")")
-                spinner.text = chalk.green.italic("opencode serve running") + chalk.yellow.italic("  •  Starting ngrok tunnel...")
-                debug("ngrok spawned", { pid: ngrok.pid })
-            })
-            ngrok.on("error", (err) => {
-                logCrosscode("ngrok error: " + err.message)
-                debug("ngrok error", { error: err.message })
-            })
-            ngrok.stdout?.on("data", d => { ngrokLogStream.write(d); cloudflaredLogStream.write(d) })
-            ngrok.stderr?.on("data", d => { ngrokLogStream.write(d); cloudflaredLogStream.write(d) })
-
-            const pollNgrokApi = () => {
-                debug("polling ngrok API")
-                const req = http.get("http://127.0.0.1:4040/api/tunnels", { agent: proxyAgent }, (res) => {
-                    let data = ""
-                    res.on("data", chunk => data += chunk)
-                    res.on("end", () => {
-                        debug("ngrok API response", { size: data.length })
-                        try {
-                            const json = JSON.parse(data)
-                            if (json.tunnels && json.tunnels.length > 0 && !tunnelUrl) {
-                                tunnelUrl = json.tunnels[0].public_url
-                                spinner.succeed(chalk.green("Tunnel ready"))
-                                logCrosscode("ngrok tunnel ready: " + tunnelUrl)
-                                debug("ngrok tunnel ready", { tunnelUrl })
-                                printTunnelQr(tunnelUrl, sessionToken, opencodePort, port)
-                            }
-                        } catch (e) {
-                            debug("ngrok API parse error", { error: e instanceof Error ? e.message : String(e) })
-                            setTimeout(pollNgrokApi, 500)
-                        }
-                    })
-                })
-                req.on("error", (e) => {
-                    debug("ngrok API request error", { error: e.message })
-                    setTimeout(pollNgrokApi, 500)
-                })
-            }
-
-            setTimeout(pollNgrokApi, 1000)
-        })
-    } else if (tunnelProvider === "cloudflared" || tunnelFailed) {
-        const spinner = ora(chalk.blue("Starting ", chalk.italic("opencode serve"))).start()
-
-        const sessionToken = ensureSessionToken(config, project)
-
-        const opencode = spawnCmd("opencode", ["serve", "--print-logs", "--log-level", "DEBUG", "--port", String(port), "--hostname", "127.0.0.1"], {
-            cwd: process.cwd(),
-            env: { ...process.env, OPENCODE_SERVER_PASSWORD: sessionToken },
-            stdio: ["ignore", "pipe", "pipe"]
-        })
-
-        children.push(opencode)
-
-        let opencodePort = port
-
-        opencode.on("spawn", () => {
-            spinner.text = chalk.green.italic("opencode serve running") + chalk.yellow.italic("  •  Detecting port...")
-            logCrosscode("opencode serve started (PID: " + opencode.pid + ")")
-            debug("opencode spawned", { pid: opencode.pid })
-        })
-        opencode.on("error", (err) => {
-            spinner.fail(chalk.red.italic("Failed to start opencode serve"))
-            logCrosscode("opencode serve error: " + err.message)
-            debug("opencode spawn error", { error: err.message })
-        })
-
-        let proxyPort = await getFreePort()
-        while (proxyPort === port) proxyPort = await getFreePort()
-
-        waitForOpencodePort({ proc: opencode, requestedPort: port, onData: d => opencodeLogStream.write(d) }).then((detectedPort) => {
-            opencodePort = detectedPort
-            if (detectedPort !== port) {
-                logCrosscode(`Using detected port ${detectedPort} instead of requested port ${port}`)
-                debug("using detected port", { detected: detectedPort, requested: port })
-            }
-
-            const proxy = createOpencodeProxy(detectedPort, sessionToken, "cf-proxy")
-
-            proxy.listen(proxyPort, "127.0.0.1", async () => {
-                logCrosscode(`SSE proxy started on port ${proxyPort}`)
-                debug("proxy listening", { port: proxyPort, targetPort: detectedPort })
-                spinner.text = chalk.green.italic("opencode serve running") + chalk.yellow.italic("  •  Waiting for Cloudflare tunnel...")
-
-                const namedTunnel = await ensureCloudflaredNamedTunnel(config, project)
-                if (!namedTunnel) {
-                    logCrosscode("Using ephemeral quick tunnel (URL changes on restart). Run `cloudflared tunnel login` once for a stable, persistent URL.")
-                }
-
-                function setTunnelUrl(url: string) {
-                    if (tunnelUrl) return
-                    tunnelUrl = url
-                    spinner.succeed(chalk.green("Tunnel ready"))
-                    logCrosscode("Cloudflare tunnel ready: " + tunnelUrl)
-                    debug("cloudflare tunnel ready", { tunnelUrl })
-                    printTunnelQr(tunnelUrl, sessionToken, opencodePort, port)
-                }
-
-                function startCloudflared(): import("child_process").ChildProcess {
-                    let cfArgs: string[]
-                    if (namedTunnel) {
-                        const cfgPath = join(cloudflaredTunnelDir, `${namedTunnel.name}.yml`)
-                        writeFileSync(cfgPath, `url: http://127.0.0.1:${proxyPort}\ntunnel: ${namedTunnel.name}\ncredentials-file: ${namedTunnel.credentialsPath}\n`, { mode: 0o600 })
-                        cfArgs = ["tunnel", "--no-autoupdate", "--config", cfgPath, "run"]
-                    } else {
-                        cfArgs = ["tunnel", "--no-autoupdate", "--config", "/dev/null", "--url", `http://127.0.0.1:${proxyPort}`]
-                    }
-
-                    const cf = spawnCmd("cloudflared", cfArgs, { stdio: ["ignore", "pipe", "pipe"] })
-                    children.push(cf)
-
-                    cf.on("spawn", () => {
-                        logCrosscode("cloudflared started (PID: " + cf.pid + ")")
-                        debug("cloudflared spawned", { pid: cf.pid })
-                    })
-                    cf.on("error", (err) => {
-                        logCrosscode("cloudflared error: " + err.message)
-                        debug("cloudflared error", { error: err.message })
-                    })
-
-                    cf.stdout?.on("data", d => cloudflaredLogStream.write(d))
-
-                    cf.stderr?.on("data", (data: Buffer) => {
-                        const text = data.toString()
-                        const m = text.match(/https:\/\/[a-zA-Z0-9.-]+\.(trycloudflare|cfargotunnel)\.com/)
-                        if (m && !tunnelUrl) setTunnelUrl(m[0])
-                        cloudflaredLogStream.write(data)
-                    })
-
-                    cf.on("exit", (code) => {
-                        logCrosscode("cloudflared exited (code: " + code + ")")
-                        if (isShuttingDown) return
-                        if (namedTunnel) {
-                            logCrosscode("Restarting cloudflared (named tunnel keeps stable URL)")
-                            console.log(chalk.yellow("\n Cloudflare tunnel dropped — reconnecting (URL unchanged)...\n"))
-                            startCloudflared()
-                        } else {
-                            console.log(chalk.red("\n Cloudflare tunnel exited. The session URL may have changed — restart crosscode to reconnect.\n"))
-                        }
-                    })
-
-                    return cf
-                }
-
-                const cf = startCloudflared()
-
-                if (namedTunnel?.url && !tunnelUrl) {
-                    const urlFallbackTimer = setTimeout(() => {
-                        if (!tunnelUrl) setTunnelUrl(namedTunnel.url)
-                    }, 8000)
-                    cf.on("exit", () => clearTimeout(urlFallbackTimer))
-                }
-            })
-
-        })
+    } else if (tunnelProvider === "ngrok") {
+        await startNgrokProvider(
+            config, project, port, children,
+            (url) => { tunnelUrl = url },
+            printTunnelQr,
+        )
+    } else {
+        await startCloudflaredProvider(
+            config, project, port, children,
+            () => isShuttingDown,
+            (url) => { tunnelUrl = url },
+            printTunnelQr,
+        )
     }
 
     const toggleLogs = async () => {
@@ -1069,18 +223,17 @@ ${chalk.dim("Documentation: https://github.com/snhsish/crosscode")}
         }
     }
 
-    const shutdown = (source?: string) => {
+    // Fix I1: await log stream flush before exiting
+    const shutdown = async (source?: string) => {
+        if (isShuttingDown) return
         isShuttingDown = true
         console.log(chalk.yellow("\nShutting down..."))
         logCrosscode(`Shutting down... (source: ${source || "unknown"})`)
         debug("shutdown initiated", { source: source || "unknown" })
-        crosscodeLogStream.end()
-        cloudflaredLogStream.end()
-        ngrokLogStream.end()
-        opencodeLogStream.end()
-        proxyAgent.destroy()
         children.forEach(c => c.kill())
         cleanupKeypress()
+        proxyAgent.destroy()
+        await closeAllLogs()
         process.exit(0)
     }
 
@@ -1098,22 +251,22 @@ ${chalk.dim("Documentation: https://github.com/snhsish/crosscode")}
         debug("stdin close event")
     })
 
+    // Fix M2: 'h' keypress now handled
     onKeypress((key: string) => {
         if (key === "l")
             toggleLogs()
+        else if (key === "h")
+            printHelp()
         else if (key === "ctrl-c")
             shutdown("ctrl-c keypress")
     })
 }
 
 main()
-    .catch(err => {
+    .catch(async err => {
         console.error(chalk.red(err))
-        logCrosscode("Fatal error: " + err.message)
-        crosscodeLogStream.end()
-        cloudflaredLogStream.end()
-        ngrokLogStream.end()
-        opencodeLogStream.end()
+        logCrosscode("Fatal error: " + (err instanceof Error ? err.message : String(err)))
         proxyAgent.destroy()
+        await closeAllLogs()
         process.exit(1)
     })
