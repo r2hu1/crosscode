@@ -61,7 +61,16 @@ export async function readFileContent(url: string, token: string, path: string):
         },
     })
     if (!res.ok) throw new Error(`Failed to read file (${res.status})`)
-    const text = await res.text()
+    const raw = await res.text()
+    let text = raw
+    try {
+        const data = JSON.parse(raw) as { content?: unknown; text?: unknown; data?: unknown }
+        if (typeof data.content === "string") text = data.content
+        else if (typeof data.text === "string") text = data.text
+        else if (typeof data.data === "string") text = data.data
+    } catch {
+        text = raw
+    }
     return text.length > MAX_CONTENT_BYTES ? text.slice(0, MAX_CONTENT_BYTES) : text
 }
 
