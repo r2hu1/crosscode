@@ -5,6 +5,7 @@ import type { TunnelC2S, TunnelS2C } from "@crosscode/shared"
 const TUNNEL_WS_URL = process.env.CROSSCODE_TUNNEL_WS_URL || "wss://connect.crosscode.site/ws"
 const INITIAL_BACKOFF_MS = 1_000
 const MAX_BACKOFF_MS = 30_000
+const HEARTBEAT_TIMEOUT_MS = 60_000
 const DEBUG = process.env.CROSSCODE_DEBUG === "1"
 
 interface InFlightRequest {
@@ -38,24 +39,43 @@ export function connectTunnel(
   let ws: WebSocket | null = null
   let backoff = INITIAL_BACKOFF_MS
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  let heartbeatTimer: ReturnType<typeof setTimeout> | null = null
+  let reconnecting = false
   let shuttingDown = false
   const inFlight = new Map<string, InFlightRequest>()
   const wsUrl = tunnelWsUrl || TUNNEL_WS_URL
 
+  function resetHeartbeat() {
+    if (heartbeatTimer) clearTimeout(heartbeatTimer)
+    heartbeatTimer = setTimeout(() => {
+      debug("heartbeat timeout, closing WS")
+      ws?.close()
+    }, HEARTBEAT_TIMEOUT_MS)
+  }
+
+  function clearHeartbeat() {
+    if (heartbeatTimer) {
+      clearTimeout(heartbeatTimer)
+      heartbeatTimer = null
+    }
+  }
+
   function connect() {
     if (shuttingDown) return
+    reconnecting = false
 
     debug("connecting", { url: wsUrl })
     ws = new WebSocket(wsUrl)
 
     ws.on("open", () => {
-      backoff = INITIAL_BACKOFF_MS
+      resetHeartbeat()
       debug("connected, sending auth", { projectId })
       const authMsg: TunnelC2S = { type: "auth", apiKey, projectId }
       ws!.send(JSON.stringify(authMsg))
     })
 
     ws.on("message", (raw) => {
+      resetHeartbeat()
       let msg: TunnelS2C
       try {
         msg = JSON.parse(raw.toString())
@@ -66,6 +86,7 @@ export function connectTunnel(
 
       switch (msg.type) {
         case "auth.ok":
+          backoff = INITIAL_BACKOFF_MS
           debug("auth succeeded", { tunnelUrl: msg.tunnelUrl })
           onTunnelUrl(msg.tunnelUrl)
           break
@@ -74,6 +95,7 @@ export function connectTunnel(
           debug("auth failed", { reason: msg.reason })
           onError(new Error(msg.reason))
           shuttingDown = true
+          clearHeartbeat()
           ws?.close()
           break
 
@@ -94,14 +116,17 @@ export function connectTunnel(
 
     ws.on("close", (code, reason) => {
       debug("connection closed", { code, reason: reason.toString() })
-      abortAllInFlight()
-      if (!shuttingDown) scheduleReconnect()
+      clearHeartbeat()
+      if (!reconnecting) {
+        reconnecting = true
+        abortAllInFlight()
+        if (!shuttingDown) scheduleReconnect()
+      }
     })
 
     ws.on("error", (err) => {
       debug("connection error", { error: err.message })
       abortAllInFlight()
-      if (!shuttingDown) scheduleReconnect()
     })
   }
 
@@ -204,6 +229,7 @@ export function connectTunnel(
 
   return () => {
     shuttingDown = true
+    clearHeartbeat()
     if (reconnectTimer) clearTimeout(reconnectTimer)
     abortAllInFlight()
     ws?.close()
