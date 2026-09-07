@@ -20,9 +20,11 @@ interface CodeBlockProps {
     text: string
     language?: string
     theme: "light" | "dark"
+    header?: boolean
+    lineNumbers?: boolean
 }
 
-export function CodeBlock({ text, language, theme }: CodeBlockProps) {
+export function CodeBlock({ text, language, theme, header = true, lineNumbers = false }: CodeBlockProps) {
     const [copied, setCopied] = useState(false)
     ensurePrismLanguages()
     const prismTheme = theme === "dark" ? themes.oneDark : themes.github
@@ -34,6 +36,56 @@ export function CodeBlock({ text, language, theme }: CodeBlockProps) {
         await Clipboard.setStringAsync(code)
         setCopied(true)
         setTimeout(() => setCopied(false), 1500)
+    }
+
+    if (!header) {
+        return (
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ padding: 4 }}>
+                <Highlight code={code} language={normalizedLanguage} theme={prismTheme}>
+                    {({ tokens, getTokenProps }) => (
+                        <View>
+                            {tokens.map((line, lineIndex) => (
+                                <View key={lineIndex} className="flex-row">
+                                    {lineNumbers && (
+                                        <Text
+                                            style={[
+                                                codeTextStyle,
+                                                {
+                                                    width: 32,
+                                                    marginRight: 12,
+                                                    textAlign: "right",
+                                                    color: THEME[theme].mutedForeground,
+                                                    opacity: 0.6,
+                                                },
+                                            ]}
+                                        >
+                                            {lineIndex + 1}
+                                        </Text>
+                                    )}
+                                    <View className="flex-row flex-shrink-0">
+                                        {line.map((token, tokenIndex) => {
+                                            const tokenProps = getTokenProps({ token })
+                                            return (
+                                                <Text
+                                                    key={tokenIndex}
+                                                    style={[
+                                                        codeTextStyle,
+                                                        { color: prismTheme.plain.color },
+                                                        tokenProps.style as TextStyle | undefined,
+                                                    ]}
+                                                >
+                                                    {tokenProps.children}
+                                                </Text>
+                                            )
+                                        })}
+                                    </View>
+                                </View>
+                            ))}
+                        </View>
+                    )}
+                </Highlight>
+            </ScrollView>
+        )
     }
 
     return (
