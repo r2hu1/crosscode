@@ -1,31 +1,15 @@
 import WebSocket from "ws"
 import http from "http"
 import type { TunnelC2S, TunnelS2C } from "@crosscode/shared"
+import { debug, censorAuth } from "./util"
 
 const TUNNEL_WS_URL = process.env.CROSSCODE_TUNNEL_WS_URL || "wss://connect.crosscode.site/ws"
 const INITIAL_BACKOFF_MS = 1_000
 const MAX_BACKOFF_MS = 30_000
 const HEARTBEAT_TIMEOUT_MS = 60_000
-const DEBUG = process.env.CROSSCODE_DEBUG === "1"
 
 interface InFlightRequest {
   req: http.ClientRequest
-}
-
-function debug(msg: string, meta?: Record<string, unknown>) {
-  if (DEBUG) {
-    const ts = new Date().toISOString()
-    const extra = meta ? ` ${JSON.stringify(meta)}` : ""
-    console.log(`[${ts}] [tunnel-client] ${msg}${extra}`)
-  }
-}
-
-function censorAuth(val: string | undefined): string {
-  if (!val) return "<none>"
-  if (val.startsWith("Basic ")) {
-    return `Basic ${val.substring(6, 14)}...`
-  }
-  return `${val.substring(0, 8)}...`
 }
 
 export function connectTunnel(
