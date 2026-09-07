@@ -3,7 +3,10 @@ import { ActivityIndicator, ScrollView, View } from "react-native"
 import { useLocalSearchParams, useRouter } from "expo-router"
 import { useSafeAreaInsets } from "react-native-safe-area-context"
 import { useColorScheme } from "nativewind"
+import * as Clipboard from "expo-clipboard"
 import ArrowLeftIcon from "lucide-react-native/dist/esm/icons/arrow-left"
+import CheckIcon from "lucide-react-native/dist/esm/icons/check"
+import CopyIcon from "lucide-react-native/dist/esm/icons/copy"
 import FileQuestionIcon from "lucide-react-native/dist/esm/icons/file-question"
 import { Button } from "@/components/ui/button"
 import { Text } from "@/components/ui/text"
@@ -31,6 +34,14 @@ export default function ViewerPage() {
     const [truncated, setTruncated] = useState(false)
     const [loading, setLoading] = useState(true)
     const [error, setError] = useState<string | null>(null)
+    const [copied, setCopied] = useState(false)
+
+    const copyFile = useCallback(async () => {
+        if (!content) return
+        await Clipboard.setStringAsync(content)
+        setCopied(true)
+        setTimeout(() => setCopied(false), 1500)
+    }, [content])
 
     const binary = useMemo(() => isBinaryPath(filePath), [filePath])
     const language = useMemo(() => languageFromPath(filePath), [filePath])
@@ -83,9 +94,18 @@ export default function ViewerPage() {
                     <Text className="text-xs text-muted-foreground line-clamp-1">{directory || "/"}</Text>
                 </View>
                 {!loading && content !== null && (
-                    <View className="px-2.5 py-1.5 rounded-full bg-accent/60 border border-border/50">
-                        <Text className="text-xs text-muted-foreground uppercase">{language}</Text>
-                    </View>
+                    <Button
+                        variant="ghost"
+                        className="w-10 h-10"
+                        onPress={copyFile}
+                        accessibilityLabel={copied ? "File copied" : "Copy file"}
+                    >
+                        {copied ? (
+                            <CheckIcon size={20} color={t.foreground} />
+                        ) : (
+                            <CopyIcon size={20} color={t.foreground} />
+                        )}
+                    </Button>
                 )}
             </View>
 
@@ -114,7 +134,7 @@ export default function ViewerPage() {
                     className="flex-1"
                     contentContainerStyle={{ padding: 12, paddingBottom: insets.bottom + 20 }}
                 >
-                    <CodeBlock text={content ?? ""} language={language} theme={theme} />
+                    <CodeBlock text={content ?? ""} language={language} theme={theme} header={false} lineNumbers />
                     {truncated && (
                         <Text className="text-xs text-muted-foreground text-center mt-3">
                             Preview limited to the first {MAX_LINES.toLocaleString()} lines.
