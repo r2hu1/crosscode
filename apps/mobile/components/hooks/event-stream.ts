@@ -300,11 +300,52 @@ export function useEventStream(url?: string, sessionId?: string, token?: string,
 
                 case "message.part.updated":
                 case "message.part.delta": {
+                    const isDelta = event.type === "message.part.delta"
+                    if (isDelta) {
+                        const sessionID = props.sessionID as string | undefined
+                        const messageID = (props.messageID as string | undefined) ?? (props.part as MessagePart | undefined)?.messageID
+                        const partID = (props.partID as string | undefined) ?? (props.part as MessagePart | undefined)?.id
+                        const field = (props.field as string | undefined) ?? "text"
+                        const delta = props.delta as string | undefined
+                        if (!messageID || !partID || sessionID !== currentSessionId) return
+                        if (!delta) return
+
+                        const existing = getOrCreatePending()
+                        const msgIdx = existing.findIndex(m => m.id === messageID)
+                        if (msgIdx < 0) {
+                            existing.push({
+                                id: messageID,
+                                sessionID: currentSessionId,
+                                role: "assistant",
+                                time: { created: Date.now() },
+                                agent: "build",
+                                model: { providerID: "...", modelID: "..." },
+                                parts: [{ id: partID, type: "text", text: delta } as Part],
+                            } as unknown as Message)
+                            scheduleFlush()
+                            break
+                        }
+
+                        const msg = existing[msgIdx]
+                        const parts = msg.parts ?? []
+                        const partIdx = parts.findIndex(p => p.id === partID)
+                        if (partIdx >= 0) {
+                            const existingPart = parts[partIdx] as Record<string, unknown> & { type: string }
+                            if (field === "text" && typeof (existingPart as { text?: unknown }).text === "string") {
+                                const newParts = [...parts]
+                                newParts[partIdx] = { ...existingPart, text: ((existingPart as unknown as { text: string }).text + delta) } as Part
+                                existing[msgIdx] = { ...msg, parts: newParts } as Message
+                                scheduleFlush()
+                            }
+                        } else {
+                            existing[msgIdx] = { ...msg, parts: [...parts, { id: partID, type: "text", text: delta } as Part] } as Message
+                            scheduleFlush()
+                        }
+                        break
+                    }
+
                     const part = props.part as MessagePart | undefined
                     if (!part || !part.messageID || part.sessionID !== currentSessionId) return
-
-                    const isDelta = event.type === "message.part.delta"
-                    const delta = props.delta as string | undefined
 
                     const existing = getOrCreatePending()
                     let msgIdx = existing.findIndex(m => m.id === part.messageID)
@@ -341,19 +382,54 @@ export function useEventStream(url?: string, sessionId?: string, token?: string,
                     let newParts: Part[]
                     if (partIdx >= 0) {
                         newParts = [...parts]
-                        const existingPart = newParts[partIdx]
+                        const existingPart = newParts[partIdx] as Part & { text?: unknown }
 
-                        if (isDelta && delta) {
-                            if (effectivePart.type === "text" && existingPart.type === "text") {
-                                newParts[partIdx] = { ...existingPart, text: existingPart.text + delta }
-                            } else if (effectivePart.type === "reasoning" && existingPart.type === "reasoning") {
-                                newParts[partIdx] = { ...existingPart, text: existingPart.text + delta }
+                        if (
+                            (effectivePart.type === "text" || effectivePart.type === "reasoning") &&
+                            (existingPart.type === "text" || existingPart.type === "reasoning" || !existingPart.type) &&
+                            typeof (effectivePart as { text?: unknown }).text === "string" &&
+                            typeof existingPart.text === "string"
+                        ) {
+                            const incomingText = (effectivePart as unknown as { text: string }).text
+                            const currentText = existingPart.text as string
+                            if (incomingText !== currentText) {
+                                if (incomingText.length === 0 && currentText.length > 0) {
+                                    newParts[partIdx] = { ...(effectivePart as Part), text: currentText } as Part
+                                } else if (incomingText.startsWith(currentText)) {
+                                    newParts[partIdx] = effectivePart as Part
+                                } else if (currentText.startsWith(incomingText)) {
+                                    newParts[partIdx] = { ...(effectivePart as Part), text: currentText } as Part
+                                } else if (incomingText.length >= currentText.length) {
+                                    newParts[partIdx] = effectivePart as Part
+                                } else {
+                                    newParts[partIdx] = { ...(effectivePart as Part), text: currentText } as Part
+                                }
+                            } else {
+                                newParts[partIdx] = effectivePart as Part
                             }
                         } else {
                             newParts[partIdx] = effectivePart as Part
                         }
                     } else {
-                        newParts = [...parts, effectivePart as Part]
+                        const placeholder = parts.find(
+                            (p) => p.id === effectivePart.id && (p.type === "text" || (p as { type: string }).type !== effectivePart.type)
+                        )
+                        if (
+                            placeholder &&
+                            (effectivePart.type === "text" || effectivePart.type === "reasoning") &&
+                            typeof (placeholder as { text?: unknown }).text === "string" &&
+                            typeof (effectivePart as { text?: unknown }).text === "string"
+                        ) {
+                            const placeholderText = (placeholder as unknown as { text: string }).text
+                            const incomingText = (effectivePart as unknown as { text: string }).text
+                            if (placeholderText.length > 0 && !incomingText.startsWith(placeholderText)) {
+                                newParts = [...parts.filter((p) => p.id !== effectivePart.id), { ...(effectivePart as Part), text: incomingText + placeholderText } as Part]
+                            } else {
+                                newParts = [...parts, effectivePart as Part]
+                            }
+                        } else {
+                            newParts = [...parts, effectivePart as Part]
+                        }
                     }
 
                     existing[msgIdx] = { ...msg, parts: newParts } as Message
