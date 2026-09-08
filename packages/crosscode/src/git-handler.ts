@@ -1,8 +1,8 @@
 import { execFile } from "child_process"
 import crypto from "crypto"
 import http from "http"
+import { debug } from "./util"
 
-const DEBUG = process.env.CROSSCODE_DEBUG === "1"
 const GIT_TIMEOUT_MS = 10_000
 const GIT_MAX_BUFFER = 10 * 1024 * 1024
 const FIELD_SEP = "\x1f"
@@ -43,14 +43,6 @@ export type GitCommitDetail = {
     deletions: number
 }
 
-function debug(msg: string, meta?: Record<string, unknown>) {
-    if (DEBUG) {
-        const ts = new Date().toISOString()
-        const extra = meta ? ` ${JSON.stringify(meta)}` : ""
-        console.log(`[${ts}] [git-handler] ${msg}${extra}`)
-    }
-}
-
 function sendJson(res: http.ServerResponse, status: number, body: unknown) {
     if (res.headersSent) return
     res.writeHead(status, {
@@ -82,7 +74,9 @@ function checkAuth(req: http.IncomingMessage, sessionToken: string): boolean {
             if (sep === -1) return false
             const user = decoded.slice(0, sep)
             const pass = decoded.slice(sep + 1)
-            return user === "opencode" && timingSafeEqualStr(pass, sessionToken)
+            const userOk = timingSafeEqualStr(user, "opencode")
+            const passOk = timingSafeEqualStr(pass, sessionToken)
+            return userOk && passOk
         } catch {
             return false
         }
@@ -231,12 +225,12 @@ async function handleGitCommit(
 export async function handleGitRequest(req: http.IncomingMessage, res: http.ServerResponse, opts: GitHandlerOpts): Promise<boolean> {
     let pathname: string
     try {
-        pathname = encodeURI(new URL(req.url || "/", "http://localhost").pathname)
+        pathname = new URL(req.url || "/", "http://localhost").pathname
     } catch {
         return false
     }
 
-    const isGitRoute = pathname === "/git-log" || /^\/git-commit\/[0-9a-f]{7,40}$/.test(pathname)
+    const isGitRoute = pathname === "/git-log" || /^\/git-commit\/[0-9a-fA-F]{7,40}$/.test(pathname)
     if (!isGitRoute) return false
 
     debug("git route matched", { pathname, method: req.method })
